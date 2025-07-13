@@ -1,10 +1,13 @@
 #include <avr/interrupt.h>
 #include <avr/io.h>
 #include <util/delay.h>
+#include <util/twi.h>
+#include <stdbool.h>
 #include <stddef.h>  
 
-#define F_CPU 16000000UL
-#define BAUD 9600
+#define F_CPU 16000000UL // 16 MHz
+#define F_SCL 400000UL    // 400 kHz I2C clock
+#define BAUD 9600        // UART baud rate
 #define UBRR_VAL ((F_CPU / 16 / BAUD) - 1)
 
 #define I2C_CHANNEL 0x01
@@ -32,7 +35,41 @@ volatile Packet rx_queue[RX_QUEUE_SIZE];
 volatile Packet tx_queue[TX_QUEUE_SIZE];
 volatile Packet* current_tx_packet = NULL;
 
-void setup_serial(){
+void i2c_setup(){
+    // Set bitrate (Datasheet page 180) with prescaler = 1
+    TWBR = (uint8_t)(((F_CPU / F_SCL) - 16) / (2 * 1));
+    
+    // Clear prescaler bits
+    TWSR &= ~((1 << TWPS1) | (1 << TWPS0));  
+}
+
+void i2c_start(){
+    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);  // Send START
+    while (!(TWCR & (1 << TWINT))) {}  // Wait for completion
+}
+
+void i2c_Stop(){
+    TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);  // Send STOP
+}
+
+void i2c_write(uint8_t data){
+    TWDR = data;  // Load data
+    TWCR = (1 << TWINT) | (1 << TWEN);  // Start transmission
+    while (!(TWCR & (1 << TWINT))) {}  // Wait for completion
+}
+
+uint8_t i2c_read(bool ack){
+    TWCR = (1 << TWINT) | (1 << TWEN) | (ack ? (1 << TWEA) : 0);
+    while (!(TWCR & (1 << TWINT))) {} // Wait for completion
+    return TWDR;
+}
+
+uint8_t i2c_status(){
+    return (TWSR & 0xF8);
+}
+
+
+void uart_setup(){
     // Set high and low bytes of baud rate
     UBRR0H = (uint8_t)(UBRR_VAL >> 8); 
     UBRR0L = (uint8_t)UBRR_VAL;  
@@ -114,7 +151,7 @@ ISR(USART_RX_vect){
         
         // Payload length byte
         case 1:
-            if (byte <= MAX_PAYLOAD){
+            if (byte <= MAX_PAYLOAD && byte > 0){
                 incoming_packet.length = byte;
                 state = 2;
             
@@ -270,7 +307,7 @@ void process_cfg_command(const uint8_t* payload, uint8_t length){
 }
 
 void main(){
-    setup_serial();
+    uart_setup();
     sei();
     
     while(1){
