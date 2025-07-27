@@ -5,21 +5,25 @@
 #include <stdbool.h>
 #include <stddef.h>  
 
-#define F_CPU 16000000UL // 16 MHz
-#define F_SCL 400000UL    // 400 kHz I2C clock
-#define BAUD 9600        // UART baud rate
-#define UBRR_VAL ((F_CPU / 16 / BAUD) - 1)
+#define F_CPU               16000000UL // 16 MHz
+#define BAUD                9600  
+#define UBRR_VAL            ((F_CPU / 16 / BAUD) - 1)
 
-#define I2C_CHANNEL 0x01
-#define SPI_CHANNEL 0x02
-#define CFG_CHANNEL 0x03 
+#define CHANNEL_CFG         0x00
+#define CHANNEL_I2C         0x01
+#define CHANNEL_ECHO        0xFF
 
-#define RX_QUEUE_SIZE 8
-#define TX_QUEUE_SIZE 8
-#define MAX_PAYLOAD 32
+#define RX_QUEUE_SIZE       4
+#define TX_QUEUE_SIZE       4
+#define MAX_PAYLOAD         128
+
+#define CFG_I2C_SET_FREQ    0x01
+#define I2C_READ            0x00
+#define I2C_WRITE           0x01
+
 
 typedef struct{
-    uint8_t channel; // 0x01 (I2C), 0x02 (SPI) or 0x03 (Config)
+    uint8_t channel; // CHANNEL_I2C or CHANNEL_CFG
     uint8_t length;
     uint8_t data[MAX_PAYLOAD];
 }Packet;
@@ -35,32 +39,69 @@ volatile Packet rx_queue[RX_QUEUE_SIZE];
 volatile Packet tx_queue[TX_QUEUE_SIZE];
 volatile Packet* current_tx_packet = NULL;
 
+volatile bool i2c_was_set = false;
+volatile uint16_t i2c_frequency_khz = 0;
+
 void i2c_setup(){
+    uint32_t i2c_frequency_hz = i2c_frequency_khz * 1000UL;
+    
     // Set bitrate (Datasheet page 180) with prescaler = 1
-    TWBR = (uint8_t)(((F_CPU / F_SCL) - 16) / (2 * 1));
+    uint32_t twbr = (((F_CPU / i2c_frequency_hz) - 16) / (2 * 1));
+    // Minimum and maximum frequencies
+    if (twbr > 255){
+        twbr = 255;
+    }
+    if (i2c_frequency_khz > 400){
+        twbr = 0;
+    }
+    TWBR = (uint8_t) twbr;
     
     // Clear prescaler bits
     TWSR &= ~((1 << TWPS1) | (1 << TWPS0));  
+    
+    // For interrupt based IO
+    // Enable TWI interrupt and ACK control
+    // TWCR = (1 << TWIE) | (1 << TWEA) | (1 << TWEN); 
+    // Enable global interrupts
+    //sei();  
+
+    // Change flag 
+    i2c_was_set = true;
 }
 
 void i2c_start(){
-    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);  // Send START
-    while (!(TWCR & (1 << TWINT))) {}  // Wait for completion
+    // Send START
+    TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);  
+
+    // Wait for completion
+    while (!(TWCR & (1 << TWINT))){} 
 }
 
-void i2c_Stop(){
-    TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);  // Send STOP
+void i2c_stop(){
+    // Send STOP
+    TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);  
 }
 
-void i2c_write(uint8_t data){
-    TWDR = data;  // Load data
-    TWCR = (1 << TWINT) | (1 << TWEN);  // Start transmission
-    while (!(TWCR & (1 << TWINT))) {}  // Wait for completion
+uint8_t i2c_write(uint8_t data){
+    // Load data
+    TWDR = data;
+
+    // Start transmission
+    TWCR = (1 << TWINT) | (1 << TWEN);
+
+    // Wait for completion
+    while (!(TWCR & (1 << TWINT)));
+
+    // Return TWI status
+    return (TWSR & 0xF8); 
 }
 
 uint8_t i2c_read(bool ack){
     TWCR = (1 << TWINT) | (1 << TWEN) | (ack ? (1 << TWEA) : 0);
-    while (!(TWCR & (1 << TWINT))) {} // Wait for completion
+
+    // Wait for completion
+    while (!(TWCR & (1 << TWINT))){} 
+
     return TWDR;
 }
 
@@ -138,10 +179,13 @@ ISR(USART_RX_vect){
     switch(state){
         // Channel byte
         case 0:
-            if (byte == I2C_CHANNEL || 
-                byte == SPI_CHANNEL || 
-                byte == CFG_CHANNEL){
+            if (byte == CHANNEL_I2C || 
+                byte == CHANNEL_ECHO || 
+                byte == CHANNEL_CFG){
+                // Fill channel info
                 incoming_packet.channel = byte;
+                
+                // Go to next state
                 state = 1;
             }else{
                 // Go to lock until terminator state check and wait there
@@ -223,6 +267,9 @@ ISR(USART_RX_vect){
             if (byte == '\n'){
                 state = 0;
                 payload_idx = 0;
+                
+                // Warn host about broken packet
+                uart_send_nack(CHANNEL_CFG);
             }else{
                 // Go back to first byte of the lock
                 state = 5;
@@ -303,7 +350,32 @@ ISR(USART_UDRE_vect){
 }
 
 void process_cfg_command(const uint8_t* payload, uint8_t length){
+    if (length < 1){
+        uart_send_nack(CHANNEL_CFG);
+        return;
+    }
 
+    uint8_t command = payload[0];
+    Packet response;
+    response.channel = CHANNEL_CFG;
+
+    switch(command){
+        case CFG_I2C_SET_FREQ:
+            if (length != 3){
+                uart_send_nack(CHANNEL_CFG);
+            }else{
+                i2c_frequency_khz = ((uint16_t)payload[1] << 8) | payload[2]; 
+
+                i2c_setup();
+
+                uart_send_ack(CHANNEL_CFG);
+            }
+            break;
+        
+        default:
+            uart_send_nack(CHANNEL_CFG);
+            break;
+    }       
 }
 
 void main(){
@@ -313,17 +385,80 @@ void main(){
     while(1){
         // If UART queue is not empty
         if (rx_tail != rx_head){
-            // Check if the message was sent for the Config channel
-            if (rx_queue[rx_tail].channel == CFG_CHANNEL){
+            // Process a config command
+            if (rx_queue[rx_tail].channel == CHANNEL_CFG){
                 process_cfg_command(&rx_queue[rx_tail].data, 
                                     rx_queue[rx_tail].length);
             
-            // write to either I2C or SPI
-            }else{ 
+            // Handle I2C communication
+            }else if (rx_queue[rx_tail].channel == CHANNEL_I2C && i2c_was_set == true){
+                if (rx_queue[rx_tail].length >= 2){
+                    uint8_t command = rx_queue[rx_tail].data[0];
+                    uint8_t address = rx_queue[rx_tail].data[1];
+                    
+                    // I2C WRITE
+                    if (command == I2C_WRITE){
+                        uint8_t data_len = rx_queue[rx_tail].length - 2;
+                        uint8_t* data = &rx_queue[rx_tail].data[2];
+
+                        i2c_start();
+                        
+                        // Send address + i2c write bit (0)
+                        uint8_t twi_status = i2c_write((address & 0x7F) << 1);
+                        if((twi_status != 0x18)) { // Check for SLA+W ACK
+                            uart_send_nack(CHANNEL_I2C);
+                            i2c_stop();
+                            continue;
+                        }
+
+                        // Send data
+                        for (uint8_t i = 0; i < data_len; i++){
+                            twi_status = i2c_write(data[i]);
+                            if(twi_status != 0x28) { // Check ACK
+                                uart_send_nack(CHANNEL_I2C);
+                                break;
+                            }
+                        }
+
+                        i2c_stop();
+                        uart_send_ack(CHANNEL_I2C);
+                    
+                    // I2C READ
+                    }else if (command == I2C_READ && rx_queue[rx_tail].length == 3){
+                        // Number of bytes to read
+                        uint8_t read_len = rx_queue[rx_tail].data[2];
+                        
+                        Packet response;
+                        response.channel = CHANNEL_I2C;
+                        response.length = read_len;
+
+                        i2c_start();
+
+                        // Send address + i2c read bit (1)
+                        i2c_write((address << 1) | 0x01);
+
+                        // Read bytes (send NACK on last byte)
+                        for (uint8_t i = 0; i < read_len; i++){
+                            response.data[i] = i2c_read(i == (read_len - 1) ? false : true);
+                        }
+                        i2c_stop();
+
+                        // Send data back via UART
+                        uart_send_packet(&response);
+
+                        
+                    // UNKNOWN COMMAND
+                    }else{
+                        uart_send_nack(CHANNEL_CFG);
+                    }
+                }else{
+                    uart_send_nack(CHANNEL_CFG);
+                }
+
+            // Handle echo channel
+            }else if(rx_queue[rx_tail].channel == CHANNEL_ECHO){
                 // Echo
                 uart_send_packet(&rx_queue[rx_tail]);
-                //uart_send_ack(CFG_CHANNEL);
-                //uart_send_nack(CFG_CHANNEL);
             }
 
             // Increment queue's reading position
