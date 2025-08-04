@@ -17,13 +17,13 @@
 #define TX_QUEUE_SIZE       4
 #define MAX_PAYLOAD         128
 
+#define ANY_ACK             0x00
+#define ANY_NACK            0xFF
 #define CFG_I2C_SET_FREQ    0x01
-#define I2C_READ            0x00
-#define I2C_WRITE           0x01
-
+#define CFG_I2C_SCAN        0x02
 
 typedef struct{
-    uint8_t channel; // CHANNEL_I2C or CHANNEL_CFG
+    uint8_t channel; 
     uint8_t length;
     uint8_t data[MAX_PAYLOAD];
 }Packet;
@@ -109,6 +109,50 @@ uint8_t i2c_status(){
     return (TWSR & 0xF8);
 }
 
+void i2c_scan() {
+    Packet response;
+    response.channel = CHANNEL_CFG;
+    response.length = 0;
+    
+    // Will store found addresses (up to 16)
+    uint8_t found_devices[16] = {0}; 
+    uint8_t found_count = 0;
+
+    // Scan all possible I2C addresses (7-bit, so 0x08 to 0x77)
+    for (uint8_t address = 0x08; address < 0x78; address++) {
+        i2c_start();
+
+        // Try to write to the address (even if we just want to detect presence)
+        uint8_t status = i2c_write((address << 1) | 0x00); // Write operation
+        
+        // SLA+W transmitted and ACK received
+        if (status == 0x18) { 
+            // Device responded
+            if (found_count < 16) {
+                found_devices[found_count++] = address;
+            }
+
+            // Properly terminate the successful communication
+            i2c_stop(); 
+        }else{
+            // No response or error. Send stop
+            i2c_stop();
+        }
+
+        // Small delay between attempts
+        _delay_us(100);
+    }
+
+    // Prepare response packet
+    response.length = found_count;
+    for (uint8_t i = 0; i < found_count; i++) {
+        response.data[i] = found_devices[i];
+    }
+
+    // Send the response
+    uart_send_packet(&response);
+}
+
 
 void uart_setup(){
     // Set high and low bytes of baud rate
@@ -155,7 +199,7 @@ void uart_send_ack(uint8_t channel){
     static Packet ack_packet;
     ack_packet.channel = channel;
     ack_packet.length = 1;
-    ack_packet.data[0] = 0x00;
+    ack_packet.data[0] = ANY_ACK;
     uart_send_packet(&ack_packet);
 }
 
@@ -163,7 +207,7 @@ void uart_send_nack(uint8_t channel){
     static Packet nack_packet;
     nack_packet.channel = channel;
     nack_packet.length = 1;
-    nack_packet.data[0] = 0xFF;
+    nack_packet.data[0] = ANY_NACK;
     uart_send_packet(&nack_packet);
 }
 
@@ -360,6 +404,12 @@ void process_cfg_command(const uint8_t* payload, uint8_t length){
     response.channel = CHANNEL_CFG;
 
     switch(command){
+        // ACKs host back
+        case ANY_ACK:
+            uart_send_ack(CHANNEL_CFG);
+            break;
+
+        // Set I2C clock frequency
         case CFG_I2C_SET_FREQ:
             if (length != 3){
                 uart_send_nack(CHANNEL_CFG);
@@ -371,7 +421,17 @@ void process_cfg_command(const uint8_t* payload, uint8_t length){
                 uart_send_ack(CHANNEL_CFG);
             }
             break;
+
+        // Simple I2C address scan
+        case CFG_I2C_SCAN:
+            if (i2c_was_set){
+                i2c_scan();
+            }else{
+                uart_send_nack(CHANNEL_CFG);
+            }
+            break;
         
+        // defaults to a NACK
         default:
             uart_send_nack(CHANNEL_CFG);
             break;
@@ -392,65 +452,35 @@ void main(){
             
             // Handle I2C communication
             }else if (rx_queue[rx_tail].channel == CHANNEL_I2C && i2c_was_set == true){
-                if (rx_queue[rx_tail].length >= 2){
-                    uint8_t command = rx_queue[rx_tail].data[0];
-                    uint8_t address = rx_queue[rx_tail].data[1];
+                if (rx_queue[rx_tail].length >= 1){
+                    //uint8_t command = rx_queue[rx_tail].data[0];
+                    uint8_t address = rx_queue[rx_tail].data[0];
                     
-                    // I2C WRITE
-                    if (command == I2C_WRITE){
-                        uint8_t data_len = rx_queue[rx_tail].length - 2;
-                        uint8_t* data = &rx_queue[rx_tail].data[2];
+                    uint8_t data_len = rx_queue[rx_tail].length - 1;
+                    uint8_t* data = &rx_queue[rx_tail].data[1];
 
-                        i2c_start();
-                        
-                        // Send address + i2c write bit (0)
-                        uint8_t twi_status = i2c_write((address & 0x7F) << 1);
-                        if((twi_status != 0x18)) { // Check for SLA+W ACK
-                            uart_send_nack(CHANNEL_I2C);
-                            i2c_stop();
-                            continue;
-                        }
-
-                        // Send data
-                        for (uint8_t i = 0; i < data_len; i++){
-                            twi_status = i2c_write(data[i]);
-                            if(twi_status != 0x28) { // Check ACK
-                                uart_send_nack(CHANNEL_I2C);
-                                break;
-                            }
-                        }
-
-                        i2c_stop();
-                        uart_send_ack(CHANNEL_I2C);
+                    i2c_start();
                     
-                    // I2C READ
-                    }else if (command == I2C_READ && rx_queue[rx_tail].length == 3){
-                        // Number of bytes to read
-                        uint8_t read_len = rx_queue[rx_tail].data[2];
-                        
-                        Packet response;
-                        response.channel = CHANNEL_I2C;
-                        response.length = read_len;
-
-                        i2c_start();
-
-                        // Send address + i2c read bit (1)
-                        i2c_write((address << 1) | 0x01);
-
-                        // Read bytes (send NACK on last byte)
-                        for (uint8_t i = 0; i < read_len; i++){
-                            response.data[i] = i2c_read(i == (read_len - 1) ? false : true);
-                        }
+                    // Send address + i2c write bit (0)
+                    uint8_t twi_status = i2c_write((address & 0x7F) << 1);
+                    if((twi_status != 0x18)) { // Check for SLA+W ACK
+                        uart_send_nack(CHANNEL_I2C);
                         i2c_stop();
-
-                        // Send data back via UART
-                        uart_send_packet(&response);
-
-                        
-                    // UNKNOWN COMMAND
-                    }else{
-                        uart_send_nack(CHANNEL_CFG);
+                        continue;
                     }
+
+                    // Send data
+                    for (uint8_t i = 0; i < data_len; i++){
+                        twi_status = i2c_write(data[i]);
+                        if(twi_status != 0x28) { // Check ACK
+                            uart_send_nack(CHANNEL_I2C);
+                            break;
+                        }
+                    }
+
+                    i2c_stop();
+                    uart_send_ack(CHANNEL_I2C);
+                    
                 }else{
                     uart_send_nack(CHANNEL_CFG);
                 }

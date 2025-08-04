@@ -30,11 +30,10 @@ class SiBr:
             payload = bytes(payload)
         
         full_message = (
-            b"\x01" +                      # I2C channel
-            (len(payload) + 1).to_bytes(1, 'little') +  # Length (write_cmd + payload)
-            b"\x01" +                      # I2C_WRITE command
-            payload +                      # Actual data (which will include address of course)
-            b"\r\n"                        # Terminator
+            b"\x01" +                               # I2C channel
+            (len(payload)).to_bytes(1, 'little') +  # Payload length 
+            payload +                               # Actual data (which will include address of course)
+            b"\r\n"                                 # Terminator
         )
         
         self.ser.write(full_message)
