@@ -27,7 +27,7 @@ Note: Compilation requires `avr-gcc` and flashing requires `avrdude`.
 import sibr
 
 # Create a bridge object
-br = sibr("/dev/ttyUSB0")
+br = sibr.SiBr("/dev/ttyUSB0")
 
 # Set I2C clock frequency to 100 khz
 br.i2c_config(100)
@@ -72,4 +72,18 @@ The first byte of every payload sent to the configuration channel is a command. 
 The host can also send an `ANY_ACK` (`0x00`) command to test the communication.
 
 
+### Modules 
 
+Modules in `sibr.module` are scripted examples of peripherals that can be controlled through the bridge. They serve as ready-to-use drivers (e.g., LCD, OLED) and as templates for creating new modules to probe more complex devices under test.
+
+#### Example: OLED SSD1306
+```python
+import sibr
+from sibr.module.oled_ssd1306 import OLED_SSD1306
+br = sibr.SiBr("/dev/ttyUSB0")
+oled = OLED_SSD1306(br)
+oled.clear()
+oled.checkerboard()
+```
+
+This connects to the device, initializes the OLED, clears the screen, and draws a checkerboard pattern.
